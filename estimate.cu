@@ -1,16 +1,14 @@
-//#include <sys/time.h>
+#include <sys/time.h>
 #include "helper_cuda.h"
 #include "newuoa_h.h"
-#ifndef TESTING
 #include <curand_kernel.h>
-#endif
 
 const double dt = .25; // time step in quarters
 const int Tburn = 100/dt+1, Tsim = Tburn+20/dt+1, // only need 20 quarters
 		Tann = (Tsim-Tburn)*dt/4, Yper = 4/dt;
 
 // Thread block size
-#define THREAD_N 32//128
+#define THREAD_N 128
 
 __device__ double4 reduce_sum(double4 in, int n) {
 	extern __shared__ double4 sdata[];
@@ -83,12 +81,7 @@ __device__ inline void computeFractions(double4 *m, double x, int n) {
 
 // Simulation kernel
 __launch_bounds__(1024)
-__global__ void simulate(
-#ifndef TESTING
-curandState *const rngStates1, curandStatePhilox4_32_10 *const rngStates2,
-#else
-const double2* d_jumprand, const double2* d_rand,
-#endif
+__global__ void simulate(curandState *const rngStates1, curandStatePhilox4_32_10 *const rngStates2,
 	double4* moments, const int nsim, const double2 lambda, const double2 sigma, const double2 delta) {
 
 	// Determine thread ID
@@ -97,34 +90,22 @@ const double2* d_jumprand, const double2* d_rand,
 	int step = gridDim.x * blockDim.x; 
 	double4 m[4] = { make_double4(0,0,0,0) };
 
-#ifndef TESTING
 	// Initialise the RNG
 	curandState state1 = rngStates1[tid];
 	curandStatePhilox4_32_10 state2 = rngStates2[tid];
-#endif
 
 	for (int i = tid; i < nsim; i += step) {
-#ifndef TESTING
 		// draw initial from normal distribution with same mean and variance
 		double2 z = curand_normal2_double(&state1);
-#else
-		double2 z = d_rand[i*Tsim];
-#endif
 		z.x = sigma.x/sqrt(1+2*delta.x/lambda.x)*z.x;
 		z.y = sigma.y/sqrt(1+2*delta.y/lambda.y)*z.y;
 
 		// simulate income path in dt increments
 		double zann[Tann] = { 0 };
 		for (int t=1; t<Tsim-1; t++) {
-#ifndef TESTING
 			// Generate pseudo-random numbers
 			double2 rand = curand_normal2_double(&state1);
 			double2 jumprand = curand_uniform2_double(&state2);
-#else
-			int j = i*Tsim+t;
-			double2 rand = d_rand[j];
-			double2 jumprand = d_jumprand[j-1];
-#endif
 			z.x = jumprand.x > 1-dt*lambda.x ? sigma.x*rand.x : (1-dt*delta.x) * z.x;
 			z.y = jumprand.y > 1-dt*lambda.y ? sigma.y*rand.y : (1-dt*delta.y) * z.y;
 			if (t>=Tburn) zann[(t-Tburn)/Yper] += exp(z.x + z.y); // aggregate to annual income
@@ -139,11 +120,9 @@ const double2* d_jumprand, const double2* d_rand,
 	}
 //if (blockIdx.x==0) printf("%03d: %.15g %.15g %.15g %.15g %.15g %.15g %.15g %.15g %.15g %.15g %.15g %.15g\n",tid,m[0].x,m[0].y,m[0].z,m[0].w,m[1].x,m[1].y,m[1].z,m[1].w,m[2].x,m[2].y,m[2].z,m[2].w);
 
-#ifndef TESTING
 	// Copy RNG state back to global memory
-	rngStates1[tid] = state1;
-	rngStates2[tid] = state2;
-#endif
+//	rngStates1[tid] = state1;
+//	rngStates2[tid] = state2;
 
 	// Reduce within the block
 	m[0] = reduce_sum(m[0],nsim/step);
@@ -161,36 +140,17 @@ const double2* d_jumprand, const double2* d_rand,
 	}
 }
 
-#ifndef TESTING
 // RNG init kernel
-__global__ void initRNG(curandState *const rngStates1, curandStatePhilox4_32_10 *const rngStates2) {
-	// Determine thread ID
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-	const int seed = (int)clock64();
+static __global__ void rngSetupStates(curandState *const rngStates1, curandStatePhilox4_32_10 *const rngStates2, int device_id) {
+	// Determine global thread ID
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	// Each threadblock get different seed,
+	// Threads within a threadblock get different sequence numbers
+	const int seed = blockIdx.x + gridDim.x * device_id; //(int)clock64();
 	// Initialise the RNG
 	curand_init(seed, tid, 0, &rngStates1[tid]);
 	curand_init(seed, tid, 0, &rngStates2[tid]);
 }
-#else
-double2* read_data(int rows, int cols, const char* fname) {
-	double2* h_data = (double2*) malloc(rows*cols*sizeof(double2));
-	FILE *f;
-	f = fopen(fname,"r");
-	if (f == NULL) {
-		printf("Error opening input file!\n");
-		exit(EXIT_FAILURE);
-	}
-	for (int i=0; i<rows; i++)
-		for (int j=0; j<cols*2; j++) {
-			double num;
-			fscanf(f,"%lf",&num);
-			if (j<cols) h_data[i*cols+j].x = num;
-			else h_data[(i-1)*cols+j].y = num;
-		}
-	fclose(f);
-	return h_data;
-}
-#endif
 
 typedef struct PlanType
 {
@@ -205,14 +165,9 @@ typedef struct PlanType
 	// Device- and host-side intermediate results
 	double4 *d_moments;
 	double4 *h_moments;
-#ifndef TESTING
 	// Random number generator states
 	curandState *d_rngStates1;
 	curandStatePhilox4_32_10 *d_rngStates2;
-#else
-	double2 *d_jumprand;
-	double2 *d_rand;
-#endif
 } PlanType;
 
 typedef struct UserParamsType {
@@ -258,42 +213,24 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 	double4 *targets = pUserParams->targets;
 	double4 *moments = pUserParams->moments;
 
+	if (nx != 6 || mv != 8) {
+		fprintf(stderr,"*** dfovec incorrectly called with n=%d and mv=%d\n",nx,mv);
+		return;
+	}
+
 	for (int i=0; i<nPlans; i++)
 	{
-		int nsim = plan[i].nsim;
-		int gridSize = plan[i].gridSize;
-		double4 *d_moments = plan[i].d_moments;
-		double4 *h_moments = plan[i].h_moments;
-#ifndef TESTING
-		curandState *d_rngStates1 = plan[i].d_rngStates1;
-		curandStatePhilox4_32_10 *d_rngStates2 = plan[i].d_rngStates2;
-#else
-		double2 *d_jumprand = plan[i].d_jumprand;
-		double2 *d_rand = plan[i].d_rand;
-#endif
-		if (nx != 6 || mv != 8) {
-			fprintf(stderr,"*** dfovec incorrectly called with n=%d and mv=%d\n",nx,mv);
-			return;
-		}
-
 		double2 lambda = make_double2(2/(1+exp(-x[0])), 2/(1+exp(-x[1])));
 		double2 sigma  = make_double2(2/(1+exp(-x[2])), 2/(1+exp(-x[3])));
 		double2 delta  = make_double2(1/(1+exp(-x[4])), 1/(1+exp(-x[5])));
 
 		// Simulate the process and compute moments
 		checkCudaErrors(cudaSetDevice(plan[i].device));
-		simulate<<<gridSize, THREAD_N, THREAD_N*sizeof(double4), plan[i].stream>>>(
-#ifndef TESTING
-d_rngStates1, d_rngStates2,
-#else
-d_jumprand, d_rand, 
-#endif
-d_moments, nsim, lambda, sigma, delta);
-
+		simulate<<<plan[i].gridSize, THREAD_N, THREAD_N*sizeof(double4), plan[i].stream>>>(plan[i].d_rngStates1,  plan[i].d_rngStates2, plan[i].d_moments, plan[i].nsim, lambda, sigma, delta);
 		getLastCudaError("Failed to launch simulate kernel\n");
 
 		// Copy partial results to host
-		checkCudaErrors(cudaMemcpyAsync(h_moments, d_moments, gridSize*4*sizeof(double4), cudaMemcpyDeviceToHost, plan[i].stream));
+		checkCudaErrors(cudaMemcpyAsync(plan[i].h_moments, plan[i].d_moments, plan[i].gridSize*4*sizeof(double4), cudaMemcpyDeviceToHost, plan[i].stream));
 
 		checkCudaErrors(cudaEventRecord(plan[i].event, plan[i].stream));
 	}
@@ -307,9 +244,8 @@ d_moments, nsim, lambda, sigma, delta);
 		int nsim = 0;
 		for (int i=0; i<nPlans; i++)
 		{
-			int gridSize = plan[i].gridSize;
-			int nb = plan[i].nsim / gridSize;
-			for (int n=0; n<gridSize; n++) {
+			int nb = plan[i].nsim / plan[i].gridSize;
+			for (int n=0; n<plan[i].gridSize; n++) {
 				double4 m = plan[i].h_moments[n*4+j];
 				double d = m.x - m1, dn = d / (nsim + nb), dn2 = dn * dn, d2 = d * dn * nb * nsim;
 				m4 += m.w + d2 * dn2 * (nsim*nsim - nsim*nb + nb*nb) + 6 * dn2 * (nsim*nsim*m.y + nb*nb*m2) + 4 * dn * (nsim*m.z - nb*m3);
@@ -336,9 +272,8 @@ d_moments, nsim, lambda, sigma, delta);
 	int nsim = 0;
 	for (int i=0; i<nPlans; i++)
 	{
-		int gridSize = plan[i].gridSize;
-		int nb = plan[i].nsim / gridSize;
-		for (int n=0; n<gridSize; n++) {
+		int nb = plan[i].nsim / plan[i].gridSize;
+		for (int n=0; n<plan[i].gridSize; n++) {
 			double4 m = plan[i].h_moments[n*4+3];
 			moments[3].x += (m.x - moments[3].x) * nb / (nsim + nb);
 			moments[3].y += (m.y - moments[3].y) * nb / (nsim + nb);
@@ -362,16 +297,7 @@ d_moments, nsim, lambda, sigma, delta);
 	v_err[4] *= sqrt(0.5);
 }
 
-int main() {
-#ifndef TESTING
-	long NSIM = 1<<20;
-#else
-	long NSIM = 4992;
-	double2* h_jumprand = read_data(NSIM,Tsim,"../../earnings_estimation_output/yjumprand.txt");
-	double2* h_rand = read_data(NSIM,Tsim,"../../earnings_estimation_output/yrand.txt");
-	int gpuBase = 0;
-#endif
-
+int main(int argc, char *argv[]) {
 	// Get number of available devices
 	int GPU_N = 0;
 	checkCudaErrors(cudaGetDeviceCount(&GPU_N));
@@ -381,9 +307,17 @@ int main() {
 		exit(EXIT_FAILURE);
 	}
 	printf("CUDA-capable device count: %i\n", GPU_N);
-	if ((NSIM/GPU_N) % THREAD_N) 
+
+	long NSIM = 1;
+	if (argc<=1)
 	{
-		fprintf(stderr,"The number of simulation paths per GPU must be a multiple of block size.\n");
+		fprintf(stderr,"Usage: estimate N, where N is the exponent of two in the number of simulation paths.\n");
+		exit(EXIT_FAILURE);
+	} else
+		NSIM <<= atoi(argv[1]);
+	if (((NSIM/GPU_N) % THREAD_N) | (NSIM < GPU_N))
+	{
+		fprintf(stderr,"The number of simulation paths per GPU must be a multiple of block size %d.\n",THREAD_N);
 		exit(EXIT_FAILURE);
 	}
 
@@ -426,28 +360,17 @@ int main() {
 
 		// Allocate intermediate memory for MC results
 		// Each thread block will produce four double4 results
-		p->h_moments = (double4*)malloc(p->gridSize*4*sizeof(double4));
-		checkCudaErrors(cudaMalloc((void **)&p->d_moments, p->gridSize*4*sizeof(double4)));
+		checkCudaErrors(cudaMallocHost(&p->h_moments,p->gridSize*4*sizeof(double4)));
+		checkCudaErrors(cudaMalloc(&p->d_moments, p->gridSize*4*sizeof(double4)));
 
-#ifndef TESTING
 		// Allocate memory for RNG states
 		checkCudaErrors(cudaMalloc(&p->d_rngStates1, p->gridSize * THREAD_N * sizeof(curandState)));
 		checkCudaErrors(cudaMalloc(&p->d_rngStates2, p->gridSize * THREAD_N * sizeof(curandStatePhilox4_32_10)));
-		// Initialise RNG states
-		initRNG<<<p->gridSize, THREAD_N>>>(p->d_rngStates1, p->d_rngStates2);
-#else
-		checkCudaErrors(cudaMalloc(&p->d_jumprand, p->nsim*Tsim*sizeof(double2)));
-		checkCudaErrors(cudaMemcpy(p->d_jumprand, &h_jumprand[gpuBase], p->nsim*Tsim*sizeof(double2), cudaMemcpyHostToDevice));
-		checkCudaErrors(cudaMalloc(&p->d_rand, p->nsim*Tsim*sizeof(double2)));
-		checkCudaErrors(cudaMemcpy(p->d_rand, &h_rand[gpuBase], p->nsim*Tsim*sizeof(double2), cudaMemcpyHostToDevice));
-		gpuBase += Tsim*p->nsim;
-#endif
+		// Initialise RNG states so that each device is placed pathN random numbers apart on the random number sequence
+		rngSetupStates<<<p->gridSize, THREAD_N>>>(p->d_rngStates1, p->d_rngStates2, p->device);
+		getLastCudaError("rngSetupStates kernel failed.\n");
 		checkCudaErrors(cudaDeviceSynchronize());
 	}
-#ifdef TESTING
-	free(h_jumprand);
-	free(h_rand);
-#endif
 
 	// Target moments for USA: 0.7,0.23,17.8,0.46,11.55,0.54,0.71,0.86
 	// Target moments for Canada: 0.760,0.217,13.377,0.437,8.782,0.51,0.68,0.85
@@ -456,7 +379,7 @@ int main() {
 	userParams.targets[2] = make_double4(NAN, 0.437, NAN, 8.782); // D5LogY: Mean,Var,Skew,Kurt
 	userParams.targets[3] = make_double4(NAN, 0.51, 0.68, 0.85); // FracD1: <5%,<10%,<20%,<50%
 
-	long int n=6, mv=8, npt=2*n+1, maxfun=500*(n+1), iprint=3;
+	long int n=6, mv=8, npt=2*n+1, maxfun=500*(n+1), iprint=1;
 	double v_err[8], rhobeg=5.0, rhoend=1e-4, w[543];
 	double xmax[6] = {2,2,2,2,1,1}, xmin[6] = {0};
 //	double x[6] = {0.0972241396763905,  0.014312611368279, 1.60304896242711, 0.892309166034993, 0.947420941274568,  0.00117609031021279};
@@ -465,20 +388,20 @@ int main() {
 	for (int i=0; i<6; i++) x[i] = -log(xmax[i]/(x[i]-xmin[i])-1); // invlogistic
 	newuoa_h(n, npt, dfovec, &userParams, x, rhobeg, rhoend, iprint, maxfun, w, mv);
 
-//	struct timeval tdr0;
-//	gettimeofday (&tdr0, NULL);
+	struct timeval tdr0;
+	gettimeofday (&tdr0, NULL);
 
 	dfovec(n,mv,x,v_err,&userParams);
 	double obj = 0;
 	for (int i=0; i<mv; i++)
 		obj += v_err[i]*v_err[i];
-//	struct timeval tdr1;
-//	gettimeofday(&tdr1, NULL);
-//	double time;
-//	timeval_subtract(&time,&tdr1,&tdr0);
+	struct timeval tdr1;
+	gettimeofday(&tdr1, NULL);
+	double time;
+	timeval_subtract(&time,&tdr1,&tdr0);
 	
 	for (int i=0; i<6; i++)  x[i] = xmin[i]+xmax[i]/(1+exp(-x[i])); // logistic
-//	printf("\nTotal time (sec.): %f\n", time);
+	printf("\nTotal time (sec.): %f\n", time);
 	printf("\nFinal objective function value: %.15g\n",obj);//sqrt(obj*2/7));
 	printf("\nThe returned solution is:\n");
 	printf(" lambda: %.15g  %.15g\n",x[0],x[1]);
@@ -509,15 +432,10 @@ int main() {
 		checkCudaErrors(cudaSetDevice(p->device));
 		checkCudaErrors(cudaStreamDestroy(p->stream));
 		checkCudaErrors(cudaEventDestroy(p->event));
-		free(p->h_moments);
-	        cudaFree(p->d_moments);
-#ifndef TESTING
-		cudaFree(p->d_rngStates1);
-		cudaFree(p->d_rngStates2);
-#else
-        	cudaFree(p->d_jumprand);
-	        cudaFree(p->d_rand);
-#endif
+		checkCudaErrors(cudaFreeHost(p->h_moments));
+		checkCudaErrors(cudaFree(p->d_moments));
+		checkCudaErrors(cudaFree(p->d_rngStates1));
+		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
 	return(0);
 }

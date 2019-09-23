@@ -1,8 +1,30 @@
 #!/bin/bash
+#SBATCH --account=def-iskander
 #SBATCH --job-name=HANK
-#SBATCH --mail-type=END
-#SBATCH --gres=gpu:1
-#SBATCH --output=estimate.%j.out
-#SBATCH --error=estimate.%j.err
-
-./estimate
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:v100:8
+##SBATCH --exclusive
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=2G
+##SBATCH --time=1:00:00
+#SBATCH --error=estimate.err
+#SBATCH --output=estimate.out
+./estimate 12
+./estimate 13
+./estimate 14
+./estimate 15
+./estimate 16
+./estimate 17
+./estimate 18
+./estimate 19
+./estimate 20
+./estimate 21
+./estimate 22
+./estimate 23
+./estimate 24
+./estimate 25
+./estimate 26
+./estimate 27
+./estimate 28
+./estimate 29
+./estimate 30
