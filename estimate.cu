@@ -2,6 +2,7 @@
 #include "helper_cuda.h"
 #include "newuoa_h.h"
 #include <curand_kernel.h>
+#include <mcheck.h>
 
 const double dt = .25; // time step in quarters
 const int Tburn = 100/dt+1, Tsim = Tburn+20/dt+1, // only need 20 quarters
@@ -298,6 +299,7 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 }
 
 int main(int argc, char *argv[]) {
+	mtrace();
 	// Get number of available devices
 	int GPU_N = 0;
 	checkCudaErrors(cudaGetDeviceCount(&GPU_N));
@@ -384,21 +386,23 @@ int main(int argc, char *argv[]) {
 	double xmax[6] = {2,2,2,2,1,1}, xmin[6] = {0};
 //	double x[6] = {0.0972241396763905,  0.014312611368279, 1.60304896242711, 0.892309166034993, 0.947420941274568,  0.00117609031021279};
 	double x[6] = {.08,.007,1.6,1.6,.7,.01};
+//	double x[6] = {0.0611244618471226,0.000613274511999765,1.46320215181056,1.999691573564,0.224227629475885,0.0018853181294203};
 
 	for (int i=0; i<6; i++) x[i] = -log(xmax[i]/(x[i]-xmin[i])-1); // invlogistic
 	newuoa_h(n, npt, dfovec, &userParams, x, rhobeg, rhoend, iprint, maxfun, w, mv);
 
-	struct timeval tdr0;
+	struct timeval tdr0,tdr1;
 	gettimeofday (&tdr0, NULL);
 
 	dfovec(n,mv,x,v_err,&userParams);
-	double obj = 0;
-	for (int i=0; i<mv; i++)
-		obj += v_err[i]*v_err[i];
-	struct timeval tdr1;
+
 	gettimeofday(&tdr1, NULL);
 	double time;
 	timeval_subtract(&time,&tdr1,&tdr0);
+
+	double obj = 0;
+	for (int i=0; i<mv; i++)
+		obj += v_err[i]*v_err[i];
 	
 	for (int i=0; i<6; i++)  x[i] = xmin[i]+xmax[i]/(1+exp(-x[i])); // logistic
 	printf("\nTotal time (sec.): %f\n", time);
@@ -437,6 +441,7 @@ int main(int argc, char *argv[]) {
 		checkCudaErrors(cudaFree(p->d_rngStates1));
 		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
+	muntrace();
 	return(0);
 }
 
