@@ -2,7 +2,6 @@
 #include "helper_cuda.h"
 #include "newuoa_h.h"
 #include <curand_kernel.h>
-#include <mcheck.h>
 
 const double dt = .25; // time step in quarters
 const int Tburn = 100/dt+1, Tsim = Tburn+20/dt+1, // only need 20 quarters
@@ -299,7 +298,6 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 }
 
 int main(int argc, char *argv[]) {
-	mtrace();
 	// Get number of available devices
 	int GPU_N = 0;
 	checkCudaErrors(cudaGetDeviceCount(&GPU_N));
@@ -441,7 +439,7 @@ int main(int argc, char *argv[]) {
 		checkCudaErrors(cudaFree(p->d_rngStates1));
 		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
-	muntrace();
+	delete[] userParams.plan;
 	return(0);
 }
 
