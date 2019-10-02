@@ -1,12 +1,7 @@
-#include <sys/time.h>
-#include "helper_cuda.h"
+#include "helper_timer.h" // helper functions for timers
+#include "helper_cuda.h"      // helper functions (cuda error checking and initialization)
 #include "newuoa_h.h"
 #include <curand_kernel.h>
-
-const double dt = .25; // time step in quarters
-const int Tburn = 100/dt+1, Tsim = Tburn+20/dt+1, // only need 20 quarters
-		Tann = (Tsim-Tburn)*dt/4, Yper = 4/dt;
-
 // Thread block size
 #define THREAD_N 128
 
@@ -101,15 +96,16 @@ __global__ void simulate(curandState *const rngStates1, curandStatePhilox4_32_10
 		z.y = sigma.y/sqrt(1+2*delta.y/lambda.y)*z.y;
 
 		// simulate income path in dt increments
-		double zann[Tann] = { 0 };
-		for (int t=1; t<Tsim-1; t++) {
-			// Generate pseudo-random numbers
-			double2 rand = curand_normal2_double(&state1);
-			double2 jumprand = curand_uniform2_double(&state2);
-			z.x = jumprand.x > 1-dt*lambda.x ? sigma.x*rand.x : (1-dt*delta.x) * z.x;
-			z.y = jumprand.y > 1-dt*lambda.y ? sigma.y*rand.y : (1-dt*delta.y) * z.y;
-			if (t>=Tburn) zann[(t-Tburn)/Yper] += exp(z.x + z.y); // aggregate to annual income
-		}
+		double zann[5] = { 0.0 };
+		for (int t=-25; t<5; t++) // burn 25 years, only need 5 years
+			for (int q=0; q<16; q++) {
+				// Generate pseudo-random numbers
+				double2 rand = curand_normal2_double(&state1);
+				double2 jumprand = curand_uniform2_double(&state2);
+				z.x = jumprand.x > 1 - lambda.x/4 ? sigma.x*rand.x : (1 - delta.x/4) * z.x;
+				z.y = jumprand.y > 1 - lambda.y/4 ? sigma.y*rand.y : (1 - delta.y/4) * z.y;
+				if (t >= 0) zann[t] += exp(z.x + z.y); // aggregate to annual income
+			}
 
 //if (tid == 0) printf("%d/%d% d/%d: %.15g %.15g %.15g\n",threadIdx.x,blockDim.x,blockIdx.x,gridDim.x,log(zann[0]),log(zann[1]/zann[0]),log(zann[4]/zann[0]));
 		// Compute central moments
@@ -176,35 +172,8 @@ typedef struct UserParamsType {
 	// Host-side target moments and result destination
 	double4 targets[4];
 	double4 moments[4];
+	long nf = 0;
 } UserParamsType;
-
-int timeval_subtract (double *result, struct timeval *x, struct timeval *y)
-{
-	struct timeval result0;
-
-	/* Perform the carry for the later subtraction by updating y. */
-	if (x->tv_usec < y->tv_usec)
-	{
-		int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
-		y->tv_usec -= 1000000 * nsec;
-		y->tv_sec += nsec;
-	}
-	if (x->tv_usec - y->tv_usec > 1000000)
-	{
-		int nsec = (y->tv_usec - x->tv_usec) / 1000000;
-		y->tv_usec += 1000000 * nsec;
-		y->tv_sec -= nsec;
-	}
-
-	/* Compute the time remaining to wait.
-	tv_usec is certainly positive. */
-	result0.tv_sec = x->tv_sec - y->tv_sec;
-	result0.tv_usec = x->tv_usec - y->tv_usec;
-	*result = ((double)result0.tv_usec)/1e6 + (double)result0.tv_sec;
-
-	/* Return 1 if result is negative. */
-	return x->tv_sec < y->tv_sec;
-}
 
 static void dfovec(const long int nx, const long int mv, const double *x, double *v_err, const void * userParams) {
 	UserParamsType *pUserParams = (UserParamsType *) userParams;
@@ -212,18 +181,16 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 	int nPlans = pUserParams->nPlans;
 	double4 *targets = pUserParams->targets;
 	double4 *moments = pUserParams->moments;
+	double2 lambda = make_double2(2 / (1 + exp(-x[0])), 2 / (1 + exp(-x[1])));
+	double2 sigma = make_double2(2 / (1 + exp(-x[2])), 2 / (1 + exp(-x[3])));
+	double2 delta = make_double2(1 / (1 + exp(-x[4])), 1 / (1 + exp(-x[5])));
 
 	if (nx != 6 || mv != 8) {
 		fprintf(stderr,"*** dfovec incorrectly called with n=%d and mv=%d\n",nx,mv);
 		return;
 	}
 
-	for (int i=0; i<nPlans; i++)
-	{
-		double2 lambda = make_double2(2/(1+exp(-x[0])), 2/(1+exp(-x[1])));
-		double2 sigma  = make_double2(2/(1+exp(-x[2])), 2/(1+exp(-x[3])));
-		double2 delta  = make_double2(1/(1+exp(-x[4])), 1/(1+exp(-x[5])));
-
+	for (int i=0; i<nPlans; i++) {
 		// Simulate the process and compute moments
 		checkCudaErrors(cudaSetDevice(plan[i].device));
 		simulate<<<plan[i].gridSize, THREAD_N, THREAD_N*sizeof(double4), plan[i].stream>>>(plan[i].d_rngStates1,  plan[i].d_rngStates2, plan[i].d_moments, plan[i].nsim, lambda, sigma, delta);
@@ -238,12 +205,12 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 		checkCudaErrors(cudaSetDevice(plan[i].device));
 		cudaEventSynchronize(plan[i].event);
 	}
+
 	// Complete reduction on host
 	for (int j=0; j<3; j++) {
 		double	m1 = 0, m2 = 0, m3 = 0, m4 = 0;
 		int nsim = 0;
-		for (int i=0; i<nPlans; i++)
-		{
+		for (int i=0; i<nPlans; i++) {
 			int nb = plan[i].nsim / plan[i].gridSize;
 			for (int n=0; n<plan[i].gridSize; n++) {
 				double4 m = plan[i].h_moments[n*4+j];
@@ -270,8 +237,7 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 	// Compute fraction of dy1 less than 5%, 10%, 20% and 50%
 	moments[3] = make_double4(0.0,0.0,0.0,0.0);
 	int nsim = 0;
-	for (int i=0; i<nPlans; i++)
-	{
+	for (int i=0; i<nPlans; i++) {
 		int nb = plan[i].nsim / plan[i].gridSize;
 		for (int n=0; n<plan[i].gridSize; n++) {
 			double4 m = plan[i].h_moments[n*4+3];
@@ -295,28 +261,27 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 	v_err[7] = moments[3].w/targets[3].w-1;
 	v_err[2] *= sqrt(0.5);
 	v_err[4] *= sqrt(0.5);
+
+	++pUserParams->nf;
 }
 
 int main(int argc, char *argv[]) {
 	// Get number of available devices
 	int GPU_N = 0;
 	checkCudaErrors(cudaGetDeviceCount(&GPU_N));
-	if (!GPU_N)
-	{
+	if (!GPU_N) {
 		fprintf(stderr,"There are no CUDA devices.\n");
 		exit(EXIT_FAILURE);
 	}
 	printf("CUDA-capable device count: %i\n", GPU_N);
 
 	long NSIM = 1;
-	if (argc<=1)
-	{
+	if (argc<=1) {
 		fprintf(stderr,"Usage: estimate N, where N is the exponent of two in the number of simulation paths.\n");
 		exit(EXIT_FAILURE);
 	} else
 		NSIM <<= atoi(argv[1]);
-	if (((NSIM/GPU_N) % THREAD_N) | (NSIM < GPU_N))
-	{
+	if (((NSIM/GPU_N) % THREAD_N) | (NSIM < GPU_N)) {
 		fprintf(stderr,"The number of simulation paths per GPU must be a multiple of block size %d.\n",THREAD_N);
 		exit(EXIT_FAILURE);
 	}
@@ -324,8 +289,7 @@ int main(int argc, char *argv[]) {
 	UserParamsType userParams;
 	userParams.nPlans = GPU_N;
 	userParams.plan = new PlanType[GPU_N];
-	for (int device=0; device<GPU_N; device++)
-	{
+	for (int device=0; device<GPU_N; device++) {
 		// Attach to GPU
 		checkCudaErrors(cudaSetDevice(device));
 		// Get device properties
@@ -386,24 +350,31 @@ int main(int argc, char *argv[]) {
 	double x[6] = {.08,.007,1.6,1.6,.7,.01};
 //	double x[6] = {0.0611244618471226,0.000613274511999765,1.46320215181056,1.999691573564,0.224227629475885,0.0018853181294203};
 
-	for (int i=0; i<6; i++) x[i] = -log(xmax[i]/(x[i]-xmin[i])-1); // invlogistic
+	for (int i = 0; i<6; i++)
+		x[i] = -log(xmax[i] / (x[i] - xmin[i]) - 1); // invlogistic
+
+	//Start the timer
+	StopWatchInterface *hTimer = NULL;
+	sdkCreateTimer(&hTimer);
+	sdkResetTimer(&hTimer);
+	sdkStartTimer(&hTimer);
+
 	newuoa_h(n, npt, dfovec, &userParams, x, rhobeg, rhoend, iprint, maxfun, w, mv);
-
-	struct timeval tdr0,tdr1;
-	gettimeofday (&tdr0, NULL);
-
 	dfovec(n,mv,x,v_err,&userParams);
 
-	gettimeofday(&tdr1, NULL);
-	double time;
-	timeval_subtract(&time,&tdr1,&tdr0);
+	//Stop the timer
+	sdkStopTimer(&hTimer);
+	float time = sdkGetTimerValue(&hTimer)/userParams.nf;
+	sdkDeleteTimer(&hTimer);
 
 	double obj = 0;
 	for (int i=0; i<mv; i++)
 		obj += v_err[i]*v_err[i];
-	
-	for (int i=0; i<6; i++)  x[i] = xmin[i]+xmax[i]/(1+exp(-x[i])); // logistic
-	printf("\nTotal time (sec.): %f\n", time);
+
+	for (int i=0; i<6; i++)
+		x[i] = xmin[i]+xmax[i]/(1+exp(-x[i])); // logistic
+
+	printf("\nTime per function evaluation (ms.): %f\n", time);
 	printf("\nFinal objective function value: %.15g\n",obj);//sqrt(obj*2/7));
 	printf("\nThe returned solution is:\n");
 	printf(" lambda: %.15g  %.15g\n",x[0],x[1]);
@@ -428,8 +399,7 @@ int main(int argc, char *argv[]) {
 	printf(" FracD1Less50 %.15g\t%.15g\n",userParams.targets[3].w,userParams.moments[3].w);
 
 	// Cleanup
-	for (int device=0; device<GPU_N; device++)
-	{
+	for (int device=0; device<GPU_N; device++) {
 		PlanType *p = &userParams.plan[device];
 		checkCudaErrors(cudaSetDevice(p->device));
 		checkCudaErrors(cudaStreamDestroy(p->stream));
@@ -440,6 +410,7 @@ int main(int argc, char *argv[]) {
 		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
 	delete[] userParams.plan;
+	system("pause");
 	return(0);
 }
 
