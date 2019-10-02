@@ -167,12 +167,12 @@ typedef struct PlanType
 } PlanType;
 
 typedef struct UserParamsType {
+	int nf;
 	int nPlans;
 	PlanType *plan;
 	// Host-side target moments and result destination
 	double4 targets[4];
 	double4 moments[4];
-	long nf = 0;
 } UserParamsType;
 
 static void dfovec(const long int nx, const long int mv, const double *x, double *v_err, const void * userParams) {
@@ -287,6 +287,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	UserParamsType userParams;
+	userParams.nf = 0;
 	userParams.nPlans = GPU_N;
 	userParams.plan = new PlanType[GPU_N];
 	for (int device=0; device<GPU_N; device++) {
@@ -344,11 +345,14 @@ int main(int argc, char *argv[]) {
 	userParams.targets[3] = make_double4(NAN, 0.51, 0.68, 0.85); // FracD1: <5%,<10%,<20%,<50%
 
 	long int n=6, mv=8, npt=2*n+1, maxfun=500*(n+1), iprint=1;
-	double v_err[8], rhobeg=5.0, rhoend=1e-4, w[543];
+	double v_err[8], rhobeg=5.0, rhoend=1e-4, *w;
 	double xmax[6] = {2,2,2,2,1,1}, xmin[6] = {0};
 //	double x[6] = {0.0972241396763905,  0.014312611368279, 1.60304896242711, 0.892309166034993, 0.947420941274568,  0.00117609031021279};
 	double x[6] = {.08,.007,1.6,1.6,.7,.01};
 //	double x[6] = {0.0611244618471226,0.000613274511999765,1.46320215181056,1.999691573564,0.224227629475885,0.0018853181294203};
+
+	int wsize = (npt+11)*(npt+n)+n*(5*n+11)/2+mv*(npt+n*(n+7)/2+7);
+	checkCudaErrors(cudaMallocHost(&w,wsize*sizeof(double)));
 
 	for (int i = 0; i<6; i++)
 		x[i] = -log(xmax[i] / (x[i] - xmin[i]) - 1); // invlogistic
@@ -409,8 +413,8 @@ int main(int argc, char *argv[]) {
 		checkCudaErrors(cudaFree(p->d_rngStates1));
 		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
+	checkCudaErrors(cudaFreeHost(w));
 	delete[] userParams.plan;
-	system("pause");
 	return(0);
 }
 

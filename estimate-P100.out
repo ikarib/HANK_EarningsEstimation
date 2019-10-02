@@ -9,7 +9,7 @@ Grid size: 1024
     -6.280485E+00
  IterOpt=         164
 
-Total time (sec.): 0.890795
+Time per function evaluation (ms.): 871.975525
 
 Final objective function value: 0.00314009246385909
 
