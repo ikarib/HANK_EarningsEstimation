@@ -91,22 +91,37 @@ __global__ void simulate(curandState *const rngStates1, curandStatePhilox4_32_10
 
 	for (int i = tid; i < nsim; i += step) {
 		// draw initial from normal distribution with same mean and variance
-		double2 z = curand_normal2_double(&state1);
-		z.x = sigma.x/sqrt(1+2*delta.x/lambda.x)*z.x;
-		z.y = sigma.y/sqrt(1+2*delta.y/lambda.y)*z.y;
+		double z = curand_normal_double(&state1);
+		z *= sigma.x/sqrt(1+2*delta.x/lambda.x);
 
-		// simulate income path in dt increments
 		double zann[5] = { 0.0 };
+		double t, dt;
+		for (t=-25; t<5; t+=dt) {
+			double jumprand = curand_uniform_double(&state2);
+			dt = -log(jumprand) / lambda.x;
+			if (t<0 && t+dt>0) {
+				zann[0] += z*(exp(delta.x*t)-exp(-delta.x*dt))/delta.x;
+			}
+			
+			if (t+dt>0 && floor(t+dt)>t)
+				zann[t] += z.x*(1-exp(-delta.x*dt))/delta.x;
+			double rand = curand_normal_double(&state1);
+			z.x = sigma.x * rand;
+		}
+/*
+		// simulate income path in dt increments
 		for (int t=-25; t<5; t++) // burn 25 years, only need 5 years
 			for (int q=0; q<16; q++) {
 				// Generate pseudo-random numbers
-				double2 rand = curand_normal2_double(&state1);
 				double2 jumprand = curand_uniform2_double(&state2);
-				z.x = jumprand.x > 1 - lambda.x/4 ? sigma.x*rand.x : (1 - delta.x/4) * z.x;
-				z.y = jumprand.y > 1 - lambda.y/4 ? sigma.y*rand.y : (1 - delta.y/4) * z.y;
+				double2 rand;
+				if ((jumprand.x > 1-lambda.x) || (jumprand.y > 1-lambda.y))
+					rand = curand_normal2_double(&state1);
+				z.x = jumprand.x > 1 - lambda.x ? sigma.x*rand.x : (1 - delta.x) * z.x;
+				z.y = jumprand.y > 1 - lambda.y ? sigma.y*rand.y : (1 - delta.y) * z.y;
 				if (t >= 0) zann[t] += exp(z.x + z.y); // aggregate to annual income
 			}
-
+*/
 //if (tid == 0) printf("%d/%d% d/%d: %.15g %.15g %.15g\n",threadIdx.x,blockDim.x,blockIdx.x,gridDim.x,log(zann[0]),log(zann[1]/zann[0]),log(zann[4]/zann[0]));
 		// Compute central moments
 		computeMoments(&m[0],log(zann[0]),i/step); // logs
@@ -173,6 +188,8 @@ typedef struct UserParamsType {
 	// Host-side target moments and result destination
 	double4 targets[4];
 	double4 moments[4];
+	double xmax[6];
+	double xmin[6];
 } UserParamsType;
 
 static void dfovec(const long int nx, const long int mv, const double *x, double *v_err, const void * userParams) {
@@ -181,14 +198,13 @@ static void dfovec(const long int nx, const long int mv, const double *x, double
 	int nPlans = pUserParams->nPlans;
 	double4 *targets = pUserParams->targets;
 	double4 *moments = pUserParams->moments;
-	double2 lambda = make_double2(2 / (1 + exp(-x[0])), 2 / (1 + exp(-x[1])));
-	double2 sigma = make_double2(2 / (1 + exp(-x[2])), 2 / (1 + exp(-x[3])));
-	double2 delta = make_double2(1 / (1 + exp(-x[4])), 1 / (1 + exp(-x[5])));
 
-	if (nx != 6 || mv != 8) {
-		fprintf(stderr,"*** dfovec incorrectly called with n=%d and mv=%d\n",nx,mv);
-		return;
-	}
+	double params[6];
+	for (int i=0; i<6; i++)
+		params[i] = pUserParams->xmin[i]+(pUserParams->xmax[i]-pUserParams->xmin[i])/(1+exp(-x[i]));
+	const double2 lambda = make_double2(params[0]/4,params[1]/4); // annual
+	const double2 sigma = make_double2(params[2],params[3]);
+	const double2 delta = make_double2(params[4]/4,params[5]/4); // annual
 
 	for (int i=0; i<nPlans; i++) {
 		// Simulate the process and compute moments
@@ -344,18 +360,22 @@ int main(int argc, char *argv[]) {
 	userParams.targets[2] = make_double4(NAN, 0.437, NAN, 8.782); // D5LogY: Mean,Var,Skew,Kurt
 	userParams.targets[3] = make_double4(NAN, 0.51, 0.68, 0.85); // FracD1: <5%,<10%,<20%,<50%
 
+	for (int i=0; i<4; i++) userParams.xmax[i] = 2.0;
+	for (int i=4; i<6; i++) userParams.xmax[i] = 1.0;
+	for (int i=0; i<6; i++) userParams.xmin[i] = 0.0;
+	
 	long int n=6, mv=8, npt=2*n+1, maxfun=500*(n+1), iprint=1;
 	double v_err[8], rhobeg=5.0, rhoend=1e-4, *w;
-	double xmax[6] = {2,2,2,2,1,1}, xmin[6] = {0};
 //	double x[6] = {0.0972241396763905,  0.014312611368279, 1.60304896242711, 0.892309166034993, 0.947420941274568,  0.00117609031021279};
 	double x[6] = {.08,.007,1.6,1.6,.7,.01};
 //	double x[6] = {0.0611244618471226,0.000613274511999765,1.46320215181056,1.999691573564,0.224227629475885,0.0018853181294203};
+
 
 	int wsize = (npt+11)*(npt+n)+n*(5*n+11)/2+mv*(npt+n*(n+7)/2+7);
 	checkCudaErrors(cudaMallocHost(&w,wsize*sizeof(double)));
 
 	for (int i = 0; i<6; i++)
-		x[i] = -log(xmax[i] / (x[i] - xmin[i]) - 1); // invlogistic
+		x[i] = -log((userParams.xmax[i]-userParams.xmin[i]) / (x[i] - userParams.xmin[i]) - 1); // invlogistic
 
 	//Start the timer
 	StopWatchInterface *hTimer = NULL;
@@ -376,7 +396,7 @@ int main(int argc, char *argv[]) {
 		obj += v_err[i]*v_err[i];
 
 	for (int i=0; i<6; i++)
-		x[i] = xmin[i]+xmax[i]/(1+exp(-x[i])); // logistic
+		x[i] = userParams.xmin[i]+(userParams.xmax[i]-userParams.xmin[i])/(1+exp(-x[i])); // logistic
 
 	printf("\nTime per function evaluation (ms.): %f\n", time);
 	printf("\nFinal objective function value: %.15g\n",obj);//sqrt(obj*2/7));
@@ -403,6 +423,7 @@ int main(int argc, char *argv[]) {
 	printf(" FracD1Less50 %.15g\t%.15g\n",userParams.targets[3].w,userParams.moments[3].w);
 
 	// Cleanup
+	checkCudaErrors(cudaFreeHost(w));
 	for (int device=0; device<GPU_N; device++) {
 		PlanType *p = &userParams.plan[device];
 		checkCudaErrors(cudaSetDevice(p->device));
@@ -413,7 +434,6 @@ int main(int argc, char *argv[]) {
 		checkCudaErrors(cudaFree(p->d_rngStates1));
 		checkCudaErrors(cudaFree(p->d_rngStates2));
 	}
-	checkCudaErrors(cudaFreeHost(w));
 	delete[] userParams.plan;
 	return(0);
 }
