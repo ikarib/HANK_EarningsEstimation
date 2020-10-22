@@ -1,6 +1,6 @@
 ## Usage
 
-This repository contains a submodule [`DFLS`](./DFLS). To build, do:
+This repository contains a submodule [`DFLS`](../../../DFLS). To build, do:
 ```
 git clone --recursive https://github.com/ikarib/HANK_EarningsEstimation.git
 cd HANK_EarningsEstimation/DFLS
