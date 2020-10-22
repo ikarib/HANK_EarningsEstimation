@@ -8,3 +8,12 @@ make
 cd ..
 make
 ```
+To run on Slurm cluster manager, edit [`submit.sh`](./submit.sh) and run:
+```
+sbatch submit.sh
+```
+Otherwise, just run:
+```
+./estimate N
+```
+where N is the exponent in the 2^N Monte Carlo simulations to run on GPUs.
