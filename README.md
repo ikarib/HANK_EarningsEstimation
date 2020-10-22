@@ -16,4 +16,4 @@ Otherwise, just run:
 ```
 ./estimate N
 ```
-where N is the exponent in the 2^N Monte Carlo simulations to run on GPUs.
+where N is the exponent in the 2<sup>N</sup> Monte Carlo simulations to run on GPUs.
